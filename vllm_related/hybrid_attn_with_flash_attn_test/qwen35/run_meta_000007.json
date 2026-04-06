@@ -1,0 +1,12 @@
+{
+  "call_index": 7,
+  "dump_dir": "/workspace/vllm_related_hooks/tensor_dumps/qwen35",
+  "meta": {
+    "max_seqlen_q": 65536,
+    "max_seqlen_k": 65536,
+    "dropout_p": 0.0,
+    "causal": false,
+    "softmax_scale": 0.11785113019775792,
+    "fa_version": 2
+  }
+}
