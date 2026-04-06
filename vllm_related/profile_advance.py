@@ -3,38 +3,75 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Advanced Torch profiling script for vLLM with configurable options
-This script profiles Deepseek V2 Lite model with customizable profiling parameters.
+Advanced Torch profiling script for vLLM with configurable options.
+Profiles offline inference for any Hugging Face-compatible model with
+tensor shape tracking and optional MoE kernel selection.
 
 Usage:
-    # Basic usage with shape tracking
-    python profile_deepseek_advanced.py
+    # Basic usage with shape tracking (default small instruct model)
+    python profile_advance.py
+
+    # Specific model and MoE backend (MoE models)
+    python profile_advance.py --model deepseek-ai/DeepSeek-V2-Lite --moe-backend triton
+
+    # Non-MoE models: --moe-backend auto is fine (default)
+    python profile_advance.py --model meta-llama/Llama-3.2-1B-Instruct
 
     # With custom number of prompts
-    python profile_deepseek_advanced.py --num-prompts 10
+    python profile_advance.py --num-prompts 10
 
     # With custom output directory
-    python profile_deepseek_advanced.py --output-dir ./my_profile_traces
+    python profile_advance.py --output-dir ./my_profile_traces
 
     # Enable FLOPS tracking (slower but more detailed)
-    python profile_deepseek_advanced.py --enable-flops
+    python profile_advance.py --enable-flops
 
     # With scheduled profiling (reduced overhead)
-    python profile_deepseek_advanced.py --warmup-iters 2 --active-iters 5
+    python profile_advance.py --warmup-iters 2 --active-iters 5
 
     # Custom prompt length (default 2048 input tokens)
-    python profile_deepseek_advanced.py --prompt-tokens 4096
+    python profile_advance.py --prompt-tokens 4096
 
     # Disable CUDA graph / compile paths (eager execution; useful for profiling)
-    python profile_deepseek_advanced.py --enforce-eager
+    python profile_advance.py --enforce-eager
+
+    # Force a specific attention backend (same names as vLLM --attention-backend)
+    python profile_advance.py --model deepseek-ai/DeepSeek-V2-Lite --attention-backend TRITON_MLA
+
+    # Cap context length (same as vLLM --max-model-len)
+    python profile_advance.py --max-model-len 8192
 """
 
 import argparse
 import time
 from pathlib import Path
+from typing import get_args
 
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
+from vllm.config.kernel import MoEBackend
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+_MOE_BACKEND_CHOICES = get_args(MoEBackend)
+
+
+def _normalize_moe_backend(s: str) -> str:
+    return s.lower().replace("-", "_")
+
+
+def _parse_attention_backend(s: str) -> AttentionBackendEnum | None:
+    """Match vLLM AttentionConfig validation: 'auto' -> None, else enum by name."""
+    raw = s.strip()
+    if not raw or raw.lower() == "auto":
+        return None
+    key = raw.upper().replace("-", "_")
+    try:
+        return AttentionBackendEnum[key]
+    except KeyError:
+        valid = ", ".join(sorted(AttentionBackendEnum.__members__))
+        raise argparse.ArgumentTypeError(
+            f"invalid attention backend {s!r}; use 'auto' or one of: {valid}"
+        ) from None
 
 
 def parse_args():
@@ -44,13 +81,38 @@ def parse_args():
     parser.add_argument(
         "--model",
         type=str,
-        default="deepseek-ai/DeepSeek-V2-Lite",
-        help="Model name or path",
+        default="Qwen/Qwen2.5-0.5B-Instruct",
+        help="Hugging Face model id or local path to profile",
+    )
+    parser.add_argument(
+        "--moe-backend",
+        type=_normalize_moe_backend,
+        choices=_MOE_BACKEND_CHOICES,
+        default="auto",
+        help=(
+            "MoE expert kernel backend (MoE models only; ignored for dense models). "
+            "Use 'auto' to let vLLM choose."
+        ),
+    )
+    parser.add_argument(
+        "--attention-backend",
+        type=_parse_attention_backend,
+        default=None,
+        help=(
+            "Attention backend (vLLM AttentionBackendEnum name), e.g. FLASH_ATTN, "
+            "TRITON_MLA, FLASHINFER. Use 'auto' or omit for automatic selection."
+        ),
+    )
+    parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=None,
+        help="Maximum model context length in tokens (vLLM --max-model-len); omit for default.",
     )
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="./vllm_profile_deepseek",
+        default="./vllm_profile_traces",
         help="Directory to save profiling traces",
     )
     parser.add_argument(
@@ -115,6 +177,11 @@ def parse_args():
         default=0,
         help="Number of wait iterations before warmup",
     )
+    parser.add_argument(
+        "--enable-expert-parallel",
+        action="store_true",
+        help="Enable expert parallel",
+    )
     return parser.parse_args()
 
 
@@ -172,6 +239,15 @@ def main():
     print("vLLM Advanced Torch Profiling with Tensor Shape Tracking")
     print("=" * 80)
     print(f"Model: {args.model}")
+    print(f"MoE backend: {args.moe_backend}")
+    print(
+        "Attention backend: "
+        f"{args.attention_backend.name if args.attention_backend else 'auto'}"
+    )
+    print(
+        "max_model_len: "
+        f"{args.max_model_len if args.max_model_len is not None else 'default'}"
+    )
     print(f"Output directory: {output_dir.absolute()}")
     print(f"Number of prompts: {args.num_prompts}")
     print(f"Prompt length: {args.prompt_tokens} tokens (tokenizer-measured)")
@@ -235,7 +311,11 @@ def main():
         tensor_parallel_size=args.tensor_parallel_size,
         trust_remote_code=True,
         enforce_eager=args.enforce_eager,
+        enable_expert_parallel=args.enable_expert_parallel,
         profiler_config=profiler_config,
+        moe_backend=args.moe_backend,
+        attention_backend=args.attention_backend,
+        max_model_len=args.max_model_len,
     )
 
     print("\nStarting profiler...")
@@ -304,7 +384,6 @@ def main():
     print("- See tensor dimensions for each operation")
     print("- Identify memory-intensive operations")
     print("- Track data flow through the model")
-    print("- Analyze attention patterns and MLA operations")
     print("\nUseful Perfetto tips:")
     print("- Use 'W/S' keys to zoom in/out")
     print("- Click on operations to see detailed info including tensor shapes")
